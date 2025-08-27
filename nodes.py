@@ -13,7 +13,7 @@ import time
 import re
 import numpy as np
 import torch.nn.functional as F
-import trimesh as Trimesh
+import trimesh
 import gc
 import json
 from .hy3dshape.hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
@@ -474,10 +474,11 @@ class Hy3DBakeMultiViews:
         #mask_mr_tensor = pil2tensor(mask_mr_pil)
         
         return (pipeline, texture, mask, texture_mr, mask_mr, texture_tensor, texture_mr_tensor)
-        
+    
+
 class Hy3DInPaint:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "pipeline": ("HY3DPIPELINE", ),
@@ -489,54 +490,73 @@ class Hy3DInPaint:
             },
         }
 
-    RETURN_TYPES = ("IMAGE","IMAGE","TRIMESH", "STRING",)
-    RETURN_NAMES = ("albedo", "mr", "trimesh", "output_glb_path")
-    FUNCTION = "process"
-    CATEGORY = "Hunyuan3D21Wrapper"
-    OUTPUT_NODE = True
+    RETURN_TYPES  = ("IMAGE","IMAGE","TRIMESH","STRING",)
+    RETURN_NAMES  = ("albedo","mr","trimesh","output_glb_path")
+    FUNCTION      = "process"
+    CATEGORY      = "Hunyuan3D21Wrapper"
+    OUTPUT_NODE   = True
 
     def process(self, pipeline, albedo, albedo_mask, mr, mr_mask, output_mesh_name):
-        
-        #albedo = tensor2pil(albedo)
-        #albedo_mask = tensor2pil(albedo_mask)
-        #mr = tensor2pil(mr)
-        #mr_mask = tensor2pil(mr_mask)       
-        
+        # ---- safe base name (avoid leading dots / empty) ----
+        safe_name = (output_mesh_name or "").strip().lstrip(".") or "asset"
+
+        # Inpaint with NPARRAYs (as per original types)
         vertex_inpaint = True
-        method = "NS"       
-        
+        method = "NS"
         albedo, mr = pipeline.inpaint(albedo, albedo_mask, mr, mr_mask, vertex_inpaint, method)
-        
+
+        # Set textures on pipeline
         pipeline.set_texture_albedo(albedo)
         pipeline.set_texture_mr(mr)
 
-        temp_folder_path = os.path.join(comfy_path, "temp")
-        os.makedirs(temp_folder_path, exist_ok=True)        
-        output_mesh_path = os.path.join(temp_folder_path, f"{output_mesh_name}.obj")
-        output_temp_path = pipeline.save_mesh(output_mesh_path)
-        
-        output_glb_path = os.path.join(comfy_path, "output", f"{output_mesh_name}.glb")
-        shutil.copyfile(output_temp_path, output_glb_path)
-        
-        trimesh = Trimesh.load(output_glb_path, force="mesh")
-        
-        texture_pil = convert_ndarray_to_pil(albedo)
-        texture_mr_pil = convert_ndarray_to_pil(mr)
-        texture_tensor = pil2tensor(texture_pil)
-        texture_mr_tensor = pil2tensor(texture_mr_pil)
-        
-        output_glb_path = f"{output_mesh_name}.glb"
-        
+        # Paths
+        temp_dir   = folder_paths.get_temp_directory()
+        output_dir = folder_paths.get_output_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save OBJ; pipeline should write GLB and (ideally) return its path
+        output_mesh_path = os.path.join(temp_dir, f"{safe_name}.obj")
+        output_temp_path = pipeline.save_mesh(output_mesh_path)  # expected GLB path
+
+        # Final GLB destination (guard against blank ".glb")
+        output_glb_path = os.path.join(output_dir, f"{safe_name}.glb")
+
+        # Guarded copy (fallbacks if pipeline returned odd path)
+        src = os.path.abspath(output_temp_path or "")
+        if (not src) or (not os.path.exists(src)) or (os.path.basename(src).lower() == ".glb"):
+            candidate = os.path.join(temp_dir, f"{safe_name}.glb")
+            alt       = os.path.join(temp_dir, "asset.glb")
+            if   os.path.exists(candidate): src = candidate
+            elif os.path.exists(alt):       src = alt
+            else:
+                raise FileNotFoundError(f"GLB not found. Tried '{output_temp_path}', '{candidate}', and '{alt}'.")
+
+        dst = os.path.abspath(output_glb_path)
+        if src != dst:
+            shutil.copyfile(src, dst)
+        else:
+            print("[HY3D] GLB already at destination, skipping copy.")
+
+        # Load trimesh (for TRIMESH output)
+        mesh = trimesh.load(dst, force="mesh")
+
+        # Convert NPARRAY -> IMAGE tensors (use your existing helpers)
+        texture_albedo_pil = convert_ndarray_to_pil(albedo)
+        texture_mr_pil     = convert_ndarray_to_pil(mr)
+        texture_tensor     = pil2tensor(texture_albedo_pil)
+        texture_mr_tensor  = pil2tensor(texture_mr_pil)
+
+        # Cleanup VRAM
         pipeline.clean_memory()
-        
         del pipeline
-        
         mm.soft_empty_cache()
         torch.cuda.empty_cache()
-        gc.collect()        
-        
-        return (texture_tensor, texture_mr_tensor, trimesh, output_glb_path)         
-        
+        gc.collect()
+
+        # Must match RETURN_TYPES
+        return (texture_tensor, texture_mr_tensor, mesh, f"{safe_name}.glb")
+    
 class Hy3D21CameraConfig:
     @classmethod
     def INPUT_TYPES(s):
@@ -724,7 +744,7 @@ class Hy3D21VAEDecode:
             vae.to(offload_device)
         
         outputs.mesh_f = outputs.mesh_f[:, ::-1]
-        mesh_output = Trimesh.Trimesh(outputs.mesh_v, outputs.mesh_f)
+        mesh_output = trimesh.Trimesh(vertices=outputs.mesh_v, faces=outputs.mesh_f)
         print(f"Decoded mesh with {mesh_output.vertices.shape[0]} vertices and {mesh_output.faces.shape[0]} faces")
         
         #del pipeline
@@ -1557,6 +1577,35 @@ class Hy3D21GenerateMultiViewsBatch:
                             paint_pipeline.set_texture_albedo(albedo)
                             paint_pipeline.set_texture_mr(mr)
                             
+                            # sanitize the user-provided file base to avoid ".obj" / leading-dot names
+                            output_file_name = (output_file_name or "asset").strip().lstrip(".")
+                            if not output_file_name:
+                                output_file_name = "asset"
+
+                            # sanitize the user-provided file base to avoid ".obj" / leading-dot names
+                            output_file_name = (output_file_name or "asset").strip().lstrip(".")
+                            if not output_file_name:
+                                output_file_name = "asset"
+
+                            # make sure the final GLB path isn’t blank or ".glb"
+                            if (not output_glb_path) or (os.path.basename(output_glb_path) in ("", ".glb")):
+                                output_glb_path = os.path.join(comfy_path, "temp", f"{output_file_name}.glb")
+
+                            # build OBJ path with the sanitized base
+                            output_mesh_path = os.path.join(comfy_path, "temp", f"{output_file_name}.obj")
+
+                            # save mesh -> returns/produces a GLB on disk
+                            output_temp_path = paint_pipeline.save_mesh(output_mesh_path)
+
+                            # guarded copy to the final destination
+                            src = os.path.abspath(output_temp_path)
+                            dst = os.path.abspath(output_glb_path)
+                            if src != dst:
+                                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                                shutil.copyfile(src, dst)
+                            else:
+                                print("[HY3D] GLB already at destination, skipping copy.")
+
                             output_mesh_path = os.path.join(comfy_path, "temp", f"{output_file_name}.obj")
                             output_temp_path = paint_pipeline.save_mesh(output_mesh_path)                   
                             shutil.copyfile(output_temp_path, output_glb_path)

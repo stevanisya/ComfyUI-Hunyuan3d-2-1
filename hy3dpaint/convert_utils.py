@@ -3,18 +3,29 @@ import pygltflib
 import numpy as np
 from PIL import Image
 import base64
-import io
-import os, glob
+import os, glob, io
+from PIL import Image
+import numpy as np
 
-# ---- auto-detect helpers ----------------------------------------------------
-def _pick_latest(glob_patterns):
-    candidates = []
-    for pat in glob_patterns:
-        candidates.extend(glob.glob(pat))
-    return max(candidates, key=os.path.getmtime) if candidates else None
+def _pick_latest(dirpath: str, pattern: str):
+    files = glob.glob(os.path.join(dirpath, pattern))
+    return max(files, key=os.path.getmtime) if files else None
 
-def _detect_temp_dir(obj_path, textures_dict):
-    # Try texture dirs, then <obj_dir>/temp, then <cwd>/temp
+def _ensure_gray(path: str, value: int, size: int = 1024) -> str:
+    """Create a flat grayscale image at 'path' if it doesn't exist."""
+    if not path:
+        return path
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    Image.fromarray(np.full((size, size), value, dtype=np.uint8)).save(path)
+    return path
+
+def _detect_temp_dir(obj_path: str, textures_dict: dict) -> str:
+    """
+    Try to infer a working temp directory from texture paths or next to the OBJ.
+    Ensures the directory exists before returning it.
+    """
     candidates = [
         os.path.dirname(textures_dict.get("metallic", "") or ""),
         os.path.dirname(textures_dict.get("roughness", "") or ""),
@@ -24,179 +35,131 @@ def _detect_temp_dir(obj_path, textures_dict):
     for d in candidates:
         if d and os.path.isdir(d):
             return d
-    # fallback (will be created when needed)
-    return os.path.join(os.path.dirname(obj_path) or ".", "temp")
-
-def _resolve_tex(expected_path, temp_dir, role):  # role: "metallic" | "roughness"
-    if expected_path and os.path.exists(expected_path):
-        return expected_path
-    latest = _pick_latest([
-        os.path.join(temp_dir, f"*_{role}.jpg"),
-        os.path.join(temp_dir, f"*_{role}.jpeg"),
-        os.path.join(temp_dir, f"*_{role}.png"),
-        os.path.join(temp_dir, f"*_{role}.webp"),
-        os.path.join(temp_dir, f"*_{role}.bmp"),
-    ])
-    return latest or expected_path
-
-def _ensure_gray(path, value, size=1024):
-    """If 'path' doesn't exist, create a flat grayscale texture so PIL open won't fail."""
-    if not path:
-        return path
-    if os.path.exists(path):
-        return path
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    Image.fromarray(np.full((size, size), value, dtype=np.uint8)).save(path)
-    return path
+    # fallback: create <obj_dir>/temp
+    d = os.path.join(os.path.dirname(obj_path) or ".", "temp")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 def combine_metallic_roughness(metallic_path, roughness_path, output_path):
-    """
-    将metallic和roughness贴图合并为一张贴图
-    GLB格式要求metallic在B通道，roughness在G通道
-    """
-    # 加载贴图
-    metallic_img = Image.open(metallic_path).convert("L")  # 转为灰度
-    roughness_img = Image.open(roughness_path).convert("L")  # 转为灰度
+    """Pack Roughness→G, Metallic→B (R left as white for AO if absent)."""
+    metallic_img  = Image.open(metallic_path).convert("L")
+    roughness_img = Image.open(roughness_path).convert("L")
 
-    # 确保尺寸一致
     if metallic_img.size != roughness_img.size:
-        roughness_img = roughness_img.resize(metallic_img.size)
+        roughness_img = roughness_img.resize(metallic_img.size, Image.BICUBIC)
 
-    # 创建RGB图像
     width, height = metallic_img.size
-    combined = Image.new("RGB", (width, height))
+    metallic_array  = np.array(metallic_img, dtype=np.uint8)
+    roughness_array = np.array(roughness_img, dtype=np.uint8)
 
-    # 转为numpy数组便于操作
-    metallic_array = np.array(metallic_img)
-    roughness_array = np.array(roughness_img)
-
-    # 创建合并的数组 (R, G, B) = (AO, Roughness, Metallic)
     combined_array = np.zeros((height, width, 3), dtype=np.uint8)
-    combined_array[:, :, 0] = 255  # R通道：AO (如果没有AO贴图，设为白色)
-    combined_array[:, :, 1] = roughness_array  # G通道：Roughness
-    combined_array[:, :, 2] = metallic_array  # B通道：Metallic
+    combined_array[:, :, 0] = 255            # AO channel (R) = white when missing
+    combined_array[:, :, 1] = roughness_array
+    combined_array[:, :, 2] = metallic_array
 
-    # 转回PIL图像并保存
-    combined = Image.fromarray(combined_array)
-    combined.save(output_path)
+    Image.fromarray(combined_array).save(output_path)
     return output_path
 
 
 def create_glb_with_pbr_materials(obj_path, textures_dict, output_path):
-     # Auto-detect temp dir and resolve metallic/roughness from files already in temp
+    # 0) temp dir + safe output filename
     temp_dir = _detect_temp_dir(obj_path, textures_dict)
-    metallic_path  = _resolve_tex(textures_dict.get("metallic"),  temp_dir, "metallic")
-    roughness_path = _resolve_tex(textures_dict.get("roughness"), temp_dir, "roughness")
+    os.makedirs(temp_dir, exist_ok=True)
 
-    # Create sensible fallbacks if still missing (prevents crashes)
-    if not metallic_path:
-        metallic_path = os.path.join(temp_dir, "_metallic.jpg")
-    if not roughness_path:
-        roughness_path = os.path.join(temp_dir, "_roughness.jpg")
+    base = os.path.splitext(os.path.basename(obj_path))[0]
+    if (not base) or base.startswith(".") or base.lower() == "obj":
+        base = "asset"
 
-    metallic_path  = _ensure_gray(metallic_path, 0)     # black = no metal
-    roughness_path = _ensure_gray(roughness_path, 128)  # mid roughness
+    if (not output_path) or (os.path.basename(output_path) in ("", ".glb")):
+        output_path = os.path.join(temp_dir, f"{base}.glb")
 
-    # Write back so downstream code uses the resolved paths
-    textures_dict["metallic"]  = metallic_path
-    textures_dict["roughness"] = roughness_path
-    print(f"[HY3D convert] metallic={textures_dict['metallic']}")
-    print(f"[HY3D convert] roughness={textures_dict['roughness']}")
-    """
-    使用pygltflib创建包含完整PBR材质的GLB文件
+    # 1) Resolve metallic / roughness (.obj_metallic/.obj_roughness accepted)
+    metal = textures_dict.get("metallic", "")
+    rough = textures_dict.get("roughness", "")
+    search_dir = os.path.dirname(metal or rough or obj_path) or "."
 
-    textures_dict = {
-        'albedo': 'path/to/albedo.png',
-        'metallic': 'path/to/metallic.png',
-        'roughness': 'path/to/roughness.png',
-        'normal': 'path/to/normal.png',  # 可选
-        'ao': 'path/to/ao.png'  # 可选
-    }
-    """
-    # 1. 加载OBJ文件
-    mesh = trimesh.load(obj_path)
+    if not os.path.exists(metal):
+        cand = _pick_latest(search_dir, "*_metallic.*")
+        if cand:
+            metal = cand
+    if not os.path.exists(rough):
+        cand = _pick_latest(search_dir, "*_roughness.*")
+        if cand:
+            rough = cand
 
-    # 2. 先导出为临时GLB
-    temp_glb = "temp.glb"
-    mesh.export(temp_glb)
+    metal = _ensure_gray(metal or os.path.join(search_dir, "_metallic.jpg"), 0)      # black = no metal
+    rough = _ensure_gray(rough or os.path.join(search_dir, "_roughness.jpg"), 128)   # mid roughness
+    textures_dict["metallic"]  = metal
+    textures_dict["roughness"] = rough
 
-    # 3. 加载GLB文件进行材质编辑
-    gltf = pygltflib.GLTF2().load(temp_glb)
+    # 2) Albedo fallback (neutral mid-gray if missing)
+    albedo = textures_dict.get("albedo", "")
+    if not albedo or not os.path.exists(albedo):
+        albedo = _ensure_gray(os.path.join(temp_dir, "_albedo.jpg"), 128)
+    textures_dict["albedo"] = albedo
 
-    # 4. 准备纹理数据
-    def image_to_data_uri(image_path):
-        """将图像转换为data URI"""
-        with open(image_path, "rb") as f:
-            image_data = f.read()
-        encoded = base64.b64encode(image_data).decode()
-        return f"data:image/png;base64,{encoded}"
+    # 3) Build combined metallicRoughness (G=roughness, B=metallic)
+    mr_combined_path = os.path.join(temp_dir, "mr_combined.png")
+    combine_metallic_roughness(metal, rough, mr_combined_path)
+    textures_dict["metallicRoughness"] = mr_combined_path
 
-    # 5. 合并metallic和roughness
-    if "metallic" in textures_dict and "roughness" in textures_dict:
-        mr_combined_path = os.path.join(temp_dir, "mr_combined.png")
-        combine_metallic_roughness(textures_dict["metallic"], textures_dict["roughness"], mr_combined_path)
-        textures_dict["metallicRoughness"] = mr_combined_path
+    # 4) Export geometry to a temporary GLB, then load with pygltflib
+    tmp_glb = os.path.join(temp_dir, f"{base}_tmp.glb")
+    mesh = trimesh.load(obj_path, force="mesh")
+    mesh.export(tmp_glb)  # writes real binary .glb with geometry
+    gltf = pygltflib.GLTF2().load(tmp_glb)
 
-    # 6. 添加图像到GLTF
-    images = []
-    textures = []
+    # 5) Attach textures/images to GLTF (deterministic order)
+    def _guess_mime(p):
+        ext = os.path.splitext(p)[1].lower()
+        return {".jpg":"jpeg",".jpeg":"jpeg",".png":"png",".webp":"webp",".bmp":"bmp"}.get(ext,"png")
 
-    texture_mapping = {
-        "albedo": "baseColorTexture",
-        "metallicRoughness": "metallicRoughnessTexture",
-        "normal": "normalTexture",
-        "ao": "occlusionTexture",
-    }
+    def image_to_data_uri(p):
+        with open(p, "rb") as f:
+            data = base64.b64encode(f.read()).decode()
+        return f"data:image/{_guess_mime(p)};base64,{data}"
 
-    for tex_type, tex_path in textures_dict.items():
-        if tex_type in texture_mapping and tex_path:
-            # 添加图像
-            image = pygltflib.Image(uri=image_to_data_uri(tex_path))
-            images.append(image)
+    images, textures = [], []
+    tex_index = {}
 
-            # 添加纹理
-            texture = pygltflib.Texture(source=len(images) - 1)
-            textures.append(texture)
+    def _add_tex(role, path):
+        if not path or not os.path.exists(path):
+            return
+        images.append(pygltflib.Image(uri=image_to_data_uri(path)))
+        textures.append(pygltflib.Texture(source=len(images) - 1))
+        tex_index[role] = len(textures) - 1
 
-    # 7. 创建PBR材质
-    pbr_metallic_roughness = pygltflib.PbrMetallicRoughness(
-        baseColorFactor=[1.0, 1.0, 1.0, 1.0], metallicFactor=1.0, roughnessFactor=1.0
-    )
+    # Add in a known order
+    _add_tex("albedo",            textures_dict.get("albedo"))
+    _add_tex("metallicRoughness", textures_dict.get("metallicRoughness"))
+    _add_tex("normal",            textures_dict.get("normal"))
+    _add_tex("ao",                textures_dict.get("ao"))
 
-    # 设置纹理索引
-    texture_index = 0
-    if "albedo" in textures_dict:
-        pbr_metallic_roughness.baseColorTexture = pygltflib.TextureInfo(index=texture_index)
-        texture_index += 1
+    pbr = pygltflib.PbrMetallicRoughness(baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+                                         metallicFactor=1.0, roughnessFactor=1.0)
+    if "albedo" in tex_index:
+        pbr.baseColorTexture = pygltflib.TextureInfo(index=tex_index["albedo"])
+    if "metallicRoughness" in tex_index:
+        pbr.metallicRoughnessTexture = pygltflib.TextureInfo(index=tex_index["metallicRoughness"])
 
-    if "metallicRoughness" in textures_dict:
-        pbr_metallic_roughness.metallicRoughnessTexture = pygltflib.TextureInfo(index=texture_index)
-        texture_index += 1
+    material = pygltflib.Material(name="PBR_Material", pbrMetallicRoughness=pbr)
+    if "normal" in tex_index:
+        material.normalTexture = pygltflib.NormalTextureInfo(index=tex_index["normal"])
+    if "ao" in tex_index:
+        material.occlusionTexture = pygltflib.OcclusionTextureInfo(index=tex_index["ao"])
 
-    # 创建材质
-    material = pygltflib.Material(name="PBR_Material", pbrMetallicRoughness=pbr_metallic_roughness)
-
-    # 添加法线贴图
-    if "normal" in textures_dict:
-        material.normalTexture = pygltflib.NormalTextureInfo(index=texture_index)
-        texture_index += 1
-
-    # 添加AO贴图
-    if "ao" in textures_dict:
-        material.occlusionTexture = pygltflib.OcclusionTextureInfo(index=texture_index)
-
-    # 8. 更新GLTF
     gltf.images = images
     gltf.textures = textures
     gltf.materials = [material]
 
-    # 确保mesh使用材质
+    # Ensure first mesh uses our material
     if gltf.meshes:
-        for primitive in gltf.meshes[0].primitives:
-            primitive.material = 0
+        for prim in gltf.meshes[0].primitives:
+            prim.material = 0
 
-    # 9. 保存最终GLB
-    gltf.save(output_path)
+    # 6) Save as **binary** GLB
+    gltf.save_binary(output_path)
     print(f"PBR GLB文件已保存: {output_path}")
+    return output_path
 
 

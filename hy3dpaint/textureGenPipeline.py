@@ -12,7 +12,7 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
-import os
+import os, glob
 import torch
 import copy
 import trimesh
@@ -38,13 +38,66 @@ from diffusers.utils import logging as diffusers_logging
 diffusers_logging.set_verbosity(50)
 
 def quick_convert_with_obj2gltf(obj_path: str, glb_path: str) -> bool:
-    # 执行转换
+    # Expected names derived from the OBJ path
     textures = {
-        'albedo': obj_path.replace('.obj', '.jpg'),
+        'albedo':   obj_path.replace('.obj', '.jpg'),
         'metallic': obj_path.replace('.obj', '_metallic.jpg'),
-        'roughness': obj_path.replace('.obj', '_roughness.jpg')
-        }
+        'roughness':obj_path.replace('.obj', '_roughness.jpg'),
+    }
+
+    # Fallback resolver: newest match for a given pattern in a dir
+    def _pick_latest(dirpath: str, pattern: str):
+        files = glob.glob(os.path.join(dirpath, pattern))
+        return max(files, key=os.path.getmtime) if files else None
+
+    temp_dir = os.path.dirname(obj_path) or "."
+
+    # --- metallic fallback ---
+    if not os.path.exists(textures['metallic']):
+        cand = _pick_latest(temp_dir, "*_metallic.*")
+        if cand:
+            textures['metallic'] = cand
+
+    # --- roughness fallback ---
+    if not os.path.exists(textures['roughness']):
+        cand = _pick_latest(temp_dir, "*_roughness.*")
+        if cand:
+            textures['roughness'] = cand
+
+    # --- albedo fallback (recommended) ---
+    if not os.path.exists(textures['albedo']):
+        # try base from MR name
+        mr = _pick_latest(temp_dir, "*_metallic.*") or _pick_latest(temp_dir, "*_roughness.*")
+        baseprefix = None
+        if mr:
+            fname = os.path.basename(mr)
+            baseprefix = (fname.rsplit("_metallic", 1)[0].rsplit("_roughness", 1)[0])
+
+        candidate = None
+        if baseprefix:
+            for ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                p = os.path.join(temp_dir, baseprefix + ext)
+                if os.path.exists(p):
+                    candidate = p
+                    break
+
+        if not candidate:
+            # newest non-MR/non-combined image
+            pool = []
+            for patt in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
+                pool.extend(glob.glob(os.path.join(temp_dir, patt)))
+            pool = [p for p in pool if ("_metallic" not in p.lower()
+                                        and "_roughness" not in p.lower()
+                                        and "mr_combined" not in p.lower())]
+            if pool:
+                candidate = max(pool, key=os.path.getmtime)
+
+        if candidate:
+            textures['albedo'] = candidate
+
+    # Do the conversion with resolved textures
     create_glb_with_pbr_materials(obj_path, textures, glb_path)
+    return True
 
 class Hunyuan3DPaintConfig:
     def __init__(self, resolution, camera_azims, camera_elevs, view_weights, ortho_scale, texture_size):
