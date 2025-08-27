@@ -1,0 +1,4 @@
+# ninja log v7
+15	17009	7779053881187995	C:/Users/AI002/ComfyUI/custom_nodes/ComfyUI-Hunyuan3d-2-1/hy3dpaint/custom_rasterizer/build/temp.win-amd64-cpython-310/Release/lib/custom_rasterizer_kernel/grid_neighbor.obj	4f6d3dd31d2d3ff3
+19	17070	7779053881233000	C:/Users/AI002/ComfyUI/custom_nodes/ComfyUI-Hunyuan3d-2-1/hy3dpaint/custom_rasterizer/build/temp.win-amd64-cpython-310/Release/lib/custom_rasterizer_kernel/rasterizer.obj	a5011103f9422a80
+24	102563	7779053881272978	C:/Users/AI002/ComfyUI/custom_nodes/ComfyUI-Hunyuan3d-2-1/hy3dpaint/custom_rasterizer/build/temp.win-amd64-cpython-310/Release/lib/custom_rasterizer_kernel/rasterizer_gpu.obj	75417f2c4f870111

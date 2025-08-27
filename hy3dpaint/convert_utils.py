@@ -4,7 +4,50 @@ import numpy as np
 from PIL import Image
 import base64
 import io
+import os, glob
 
+# ---- auto-detect helpers ----------------------------------------------------
+def _pick_latest(glob_patterns):
+    candidates = []
+    for pat in glob_patterns:
+        candidates.extend(glob.glob(pat))
+    return max(candidates, key=os.path.getmtime) if candidates else None
+
+def _detect_temp_dir(obj_path, textures_dict):
+    # Try texture dirs, then <obj_dir>/temp, then <cwd>/temp
+    candidates = [
+        os.path.dirname(textures_dict.get("metallic", "") or ""),
+        os.path.dirname(textures_dict.get("roughness", "") or ""),
+        os.path.join(os.path.dirname(obj_path) or ".", "temp"),
+        os.path.join(os.getcwd(), "temp"),
+    ]
+    for d in candidates:
+        if d and os.path.isdir(d):
+            return d
+    # fallback (will be created when needed)
+    return os.path.join(os.path.dirname(obj_path) or ".", "temp")
+
+def _resolve_tex(expected_path, temp_dir, role):  # role: "metallic" | "roughness"
+    if expected_path and os.path.exists(expected_path):
+        return expected_path
+    latest = _pick_latest([
+        os.path.join(temp_dir, f"*_{role}.jpg"),
+        os.path.join(temp_dir, f"*_{role}.jpeg"),
+        os.path.join(temp_dir, f"*_{role}.png"),
+        os.path.join(temp_dir, f"*_{role}.webp"),
+        os.path.join(temp_dir, f"*_{role}.bmp"),
+    ])
+    return latest or expected_path
+
+def _ensure_gray(path, value, size=1024):
+    """If 'path' doesn't exist, create a flat grayscale texture so PIL open won't fail."""
+    if not path:
+        return path
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    Image.fromarray(np.full((size, size), value, dtype=np.uint8)).save(path)
+    return path
 
 def combine_metallic_roughness(metallic_path, roughness_path, output_path):
     """
@@ -40,6 +83,25 @@ def combine_metallic_roughness(metallic_path, roughness_path, output_path):
 
 
 def create_glb_with_pbr_materials(obj_path, textures_dict, output_path):
+     # Auto-detect temp dir and resolve metallic/roughness from files already in temp
+    temp_dir = _detect_temp_dir(obj_path, textures_dict)
+    metallic_path  = _resolve_tex(textures_dict.get("metallic"),  temp_dir, "metallic")
+    roughness_path = _resolve_tex(textures_dict.get("roughness"), temp_dir, "roughness")
+
+    # Create sensible fallbacks if still missing (prevents crashes)
+    if not metallic_path:
+        metallic_path = os.path.join(temp_dir, "_metallic.jpg")
+    if not roughness_path:
+        roughness_path = os.path.join(temp_dir, "_roughness.jpg")
+
+    metallic_path  = _ensure_gray(metallic_path, 0)     # black = no metal
+    roughness_path = _ensure_gray(roughness_path, 128)  # mid roughness
+
+    # Write back so downstream code uses the resolved paths
+    textures_dict["metallic"]  = metallic_path
+    textures_dict["roughness"] = roughness_path
+    print(f"[HY3D convert] metallic={textures_dict['metallic']}")
+    print(f"[HY3D convert] roughness={textures_dict['roughness']}")
     """
     使用pygltflib创建包含完整PBR材质的GLB文件
 
@@ -71,7 +133,7 @@ def create_glb_with_pbr_materials(obj_path, textures_dict, output_path):
 
     # 5. 合并metallic和roughness
     if "metallic" in textures_dict and "roughness" in textures_dict:
-        mr_combined_path = "mr_combined.png"
+        mr_combined_path = os.path.join(temp_dir, "mr_combined.png")
         combine_metallic_roughness(textures_dict["metallic"], textures_dict["roughness"], mr_combined_path)
         textures_dict["metallicRoughness"] = mr_combined_path
 
